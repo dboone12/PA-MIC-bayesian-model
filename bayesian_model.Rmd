@@ -1,0 +1,524 @@
+---
+title: Bayesian mixed effects modeling of antimicrobial MIC data with censoring in
+  brms
+author: "Dylan Boone"
+date: "`r Sys.Date()`"
+output: html_document
+toc_float: true
+theme: flatly
+code_folding: hide
+---
+
+## Introduction
+
+Minimum inhibitory concentration (MIC) assays are a cornerstone of microbiology 
+research. Dating back to the golden age of antibiotics, MIC assays remain essential 
+for determining the lowest concentration of a compound that inhibits bacterial growth. 
+Despite decades of methodological advancement in microbiology, the statistical 
+treatment of MIC data has largely lagged behind. MIC values are conventionally 
+treated as discrete measurements, when in reality the true MIC lies somewhere 
+between two successive two-fold dilutions.
+
+A further complication arises when strains exceed the highest concentration tested — 
+a common occurrence in resistant organisms. These **right-censored** observations are 
+typically discarded or treated as exact values, both of which introduce bias. 
+Frequentist mixed effects frameworks such as `lme4` rely on maximum likelihood 
+estimation and require exact observations, making them poorly suited for censored 
+MIC data.
+
+Here I develop a Bayesian hierarchical mixed effects model to estimate posterior 
+median MIC values for 29 clinical and reference strains of *Pseudomonas aeruginosa* 
+tested against two standard of care antibiotics — ceftazidime (CAZ) and ertapenem 
+(ETP). A Bayesian framework naturally accommodates right-censored observations, 
+propagating uncertainty from censored strains through to the final estimates rather 
+than discarding or mishandling them. MIC data were obtained using the standard Broth 
+Microdilution (BMD) assay in cation-adjusted Mueller-Hinton broth (CAMHB).
+
+## Statistical Methods
+
+### Model Overview
+
+All models were fit using the `brms` package (version 2.23.1) in R, with `cmdstanr` 
+as the Stan backend. `brms` provides a flexible interface for fitting Bayesian 
+generalized linear mixed effects models using Hamiltonian Monte Carlo (HMC) sampling 
+via Stan. Three models were fit iteratively, with each adding complexity to the 
+previous to better capture the structure of the data.
+
+---
+
+### Outcome Transformation
+
+Raw MIC values (µg/mL) were log2 transformed prior to modeling. MIC assays follow a 
+two-fold dilution series, meaning successive concentrations double at each step. Log2 
+transformation linearizes this scale such that each unit increase corresponds to one 
+dilution step, satisfying the normality assumption of the Gaussian likelihood and 
+making model coefficients directly interpretable in units of dilutions.
+
+---
+
+### Censoring
+
+Of the 648 observations, 226 were right-censored at 256 µg/mL — the highest 
+concentration tested. Rather than discarding these observations or treating them as 
+exact values of 256 µg/mL (both of which introduce bias), censored observations were 
+explicitly declared using the `cens()` response modifier in `brms`. This instructs the 
+model to evaluate the likelihood as P(MIC > 256) for censored observations rather than 
+P(MIC = 256), properly propagating uncertainty from censored strains through to the 
+posterior estimates.
+
+---
+
+```{r setup, include=FALSE}
+library(brms)
+library(tidybayes)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+
+# Tell cmdstanr where to find cmdstan
+library(cmdstanr)
+set_cmdstan_path("~/.cmdstan/cmdstan-2.38.0")
+```
+
+### Model Structure
+
+All three models shared the following general structure:
+
+$$\text{log}_2(\text{MIC})_{ijk} = \mu + \beta_{\text{antibiotic}} + u_{\text{strain}_i} + u_{\text{run}_j} + u_{\text{operator}_k} + \epsilon_{ijk}$$
+
+Where:
+- $\mu$ is the grand mean log2 MIC for CAZ (reference level)
+- $\beta_{\text{antibiotic}}$ is the fixed effect of antibiotic (ETP vs CAZ)
+- $u_{\text{strain}_i} \sim N(0, \sigma^2_{\text{strain}})$ is the strain random intercept
+- $u_{\text{run}_j} \sim N(0, \sigma^2_{\text{run}})$ is the run/day random intercept
+- $u_{\text{operator}_k} \sim N(0, \sigma^2_{\text{operator}})$ is the operator random intercept
+- $\epsilon_{ijk} \sim N(0, \sigma^2)$ is the residual error
+
+CAZ was set as the reference level for the antibiotic factor, such that the intercept 
+represents the grand mean CAZ MIC and $\beta_{\text{antibiotic}}$ represents the 
+average ETP vs CAZ difference on the log2 scale.
+
+---
+
+```{Data preprocessing}
+mic <- mic %>% mutate(
+  log2mic = log2(mic_ug_ml),
+  censored = ifelse(mic_censored == "right", "right", "none"),
+  antibiotic = factor(antibiotic, levels = c("CAZ", "ETP")),
+  operator = factor(operator),
+  run_id = factor(run_id),
+  strain = factor(strain)
+)
+```
+
+### Model Iterations
+
+**fit1** included random intercepts for strain, run, and operator, and a fixed effect 
+for antibiotic. This model assumed the ETP vs CAZ difference was uniform across all 
+strains.
+
+**fit2** extended fit1 by adding a random slope for antibiotic within strain — 
+`(antibiotic | strain)` — allowing each strain to have its own ETP vs CAZ difference. 
+This captures strain-specific antibiotic resistance patterns that a fixed effect alone 
+cannot. A prior on the correlation between strain intercepts and slopes was added using 
+the LKJ distribution. `adapt_delta` was increased to 0.95 to address a small number 
+of divergent transitions.
+
+**fit3** extended fit2 by allowing the residual standard deviation (sigma) to vary by 
+antibiotic — `sigma ~ antibiotic` — addressing the bimodal distribution observed in 
+posterior predictive checks of fit1 and fit2. CAZ and ETP have substantially different 
+MIC ranges, and modeling sigma separately for each antibiotic better reflects this 
+heterogeneity in residual spread.
+
+---
+
+### Prior Specification
+
+Priors were specified to reflect domain knowledge about *Pseudomonas aeruginosa* MIC 
+values for CAZ and ETP:
+
+| Parameter | Prior | Justification |
+|-----------|-------|---------------|
+| Intercept | Normal(5.6, 0.8) | Grand mean CAZ MIC expected ~32-64 µg/mL; log2(48) ≈ 5.6 |
+| β~ETP~ | Normal(1.5, 0.5) | ETP expected 1-2 dilutions higher than CAZ; 1.5 is midpoint |
+| σ~strain~ | Exponential(1) | Weakly informative; positive-only prior on variance component |
+| σ~run~ | Exponential(1) | Weakly informative; positive-only prior on variance component |
+| σ~operator~ | Exponential(1) | Weakly informative; positive-only prior on variance component |
+| σ~residual~ | Exponential(1) | Weakly informative; positive-only prior on residual SD |
+| Correlation | LKJ(2) | Weakly skeptical of extreme correlations between intercepts and slopes |
+| σ submodel | Normal(0, 1) | Prior on log scale sigma coefficient for antibiotic effect on residual SD |
+
+---
+
+```{Priors}
+priors <- c(
+  prior(normal(5.6, 0.8), class = Intercept),
+  prior(normal(1.5, 0.5), class = b, coef = antibioticETP),
+  prior(exponential(1), class = sd, group = strain),
+  prior(exponential(1), class = sd, group = run_id),
+  prior(exponential(1), class = sd, group = operator),
+  prior(exponential(1), class = sigma)
+)
+```
+
+### MCMC Sampling and Convergence
+
+All models were fit with 4 independent Markov chains, each running 4000 iterations 
+with the first 1000 discarded as warmup, yielding 12000 total post-warmup draws. 
+Chains were run in parallel across 4 CPU cores. A random seed of 42 was set for 
+reproducibility.
+
+Convergence was assessed using the potential scale reduction factor ($\hat{R}$) and 
+effective sample size (ESS). All parameters achieved $\hat{R}$ = 1.00 and bulk ESS 
+values well above 1000, indicating good convergence and efficient sampling. Trace 
+plots were visually inspected and confirmed the characteristic "fuzzy caterpillar" 
+appearance expected of well-mixed chains. A small number of divergent transitions 
+were observed in fit2 (32/12000) and addressed by increasing `adapt_delta` to 0.95, 
+reducing divergences to 3/12000 in the final run. fit3 divergences were negligible.
+
+
+## Results
+
+### Model 1 (fit1) — Random Intercepts
+
+All four chains converged successfully with $\hat{R}$ = 1.00 for all parameters and 
+bulk ESS values well above 1000, indicating efficient sampling and good convergence.
+
+#### Variance Components
+
+The dominant source of variation in log2 MIC was strain identity (SD = 2.78, 95% CrI: 
+2.04–3.84), which is expected given the dataset includes both susceptible reference 
+strains and MDR clinical isolates spanning several log2 dilutions in resistance. 
+
+Day-to-day run variation was the second largest source of variability (SD = 0.81, 95% 
+CrI: 0.30–1.83), corresponding to approximately 1 dilution of batch-to-batch 
+variation. This likely reflects differences in media preparation, antibiotic stock 
+age, and incubator conditions between experimental runs.
+
+Operator variation was the smallest variance component (SD = 0.59, 95% CrI: 
+0.25–1.39), contributing less than 1 dilution of variability across technicians. This 
+is reassuring from a reproducibility standpoint, suggesting the BMD assay was 
+performed consistently across operators.
+
+Residual within-cell variation (sigma = 1.20, 95% CrI: 1.12–1.29) represents 
+approximately 1 dilution of unexplained replicate-to-replicate noise remaining after 
+accounting for all modeled sources of variation, consistent with typical BMD assay 
+reproducibility.
+
+#### Fixed Effects
+
+The grand mean CAZ MIC (intercept) was estimated at 5.21 log2 µg/mL (95% CrI: 
+4.00–6.39), corresponding to approximately 37 µg/mL on the original scale. ETP MICs 
+were on average 2.16 log2 dilutions higher than CAZ (95% CrI: 1.14–3.04), equivalent 
+to approximately 4.5-fold higher on the original concentration scale (2^2.16 ≈ 4.5 
+µg/mL). The 95% credible interval for the ETP effect did not include zero, providing 
+strong evidence of a meaningful difference in resistance between the two antibiotics 
+across this strain collection.
+
+```{Fit 1}
+fit <- brm(
+  log2mic | cens(censored) ~ antibiotic + (1 | strain) + (1 | run_id) + (1 | operator),
+  data = mic,
+  family = gaussian(),
+  prior = priors,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 42,
+  backend = "cmdstanr"
+) 
+```
+
+```{Fit 1 Summary}
+summary(fit) 
+```
+
+```{Fit 1 Diagnostic Plot}
+plot(fit)
+```
+
+```{Fit 1 Posterior Median SD}
+fit %>%
+  spread_draws(r_strain[strain, term]) %>%
+  filter(term == "Intercept") %>%
+  median_qi(.width = c(0.95)) %>%
+  ggplot(aes(y = reorder(strain, r_strain), x = r_strain, xmin = .lower, xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Strain-level deviation from grand mean (log2 scale)",
+       y = "Strain",
+       title = "Strain random effects") +
+  theme_bw()
+```
+
+```{Fit 1 Observed vs Simulated}
+pp_check(fit, ndraws = 100)
+```
+
+### Model 2 (fit2) — Random Slopes for Antibiotic Within Strain
+
+fit2 extended fit1 by adding a random slope for antibiotic within strain, allowing 
+each strain to have its own ETP vs CAZ difference rather than assuming a uniform 
+antibiotic effect across all strains. An LKJ(2) prior was added on the correlation 
+between strain intercepts and slopes. `adapt_delta` was increased to 0.95 to address 
+divergent transitions, reducing them from 32 to 3 out of 12000 total draws. All 
+parameters achieved $\hat{R}$ = 1.00 with bulk ESS values well above 1000.
+
+#### Variance Components
+
+Strain intercept variation remained the dominant source of variability (SD = 2.84, 
+95% CrI: 2.04–3.96), consistent with fit1. The addition of the random slope revealed 
+substantial strain-to-strain variation in the ETP vs CAZ difference (SD = 1.92, 95% 
+CrI: 1.23–2.88), indicating that the antibiotic effect is far from uniform across 
+strains — some strains show dramatically higher ETP resistance relative to CAZ while 
+others do not.
+
+A moderate negative correlation was estimated between strain intercepts and ETP slopes 
+(cor = -0.36, 95% CrI: -0.76–0.20), suggesting that strains with higher baseline CAZ 
+MICs tend to show a slightly smaller strain-specific ETP effect. However, the credible 
+interval crossed zero and this pattern should be interpreted cautiously.
+
+Run variation decreased substantially compared to fit1 (SD = 0.33, 95% CrI: 
+0.01–1.10), suggesting that some apparent day-to-day variation in fit1 was in fact 
+strain-specific antibiotic variation now captured by the random slope. Operator 
+variation remained small and consistent with fit1 (SD = 0.63, 95% CrI: 0.28–1.43).
+
+Residual sigma decreased from 1.20 in fit1 to 1.07 (95% CrI: 0.99–1.14), indicating 
+that the random slope explained additional variance beyond what the random intercept 
+alone captured.
+
+#### Fixed Effects
+
+The grand mean CAZ intercept was stable relative to fit1 (5.29 log2 µg/mL, 95% CrI: 
+4.10–6.41, ≈ 39 µg/mL). The average ETP effect was similarly consistent (2.18 log2 
+dilutions, 95% CrI: 1.31–2.98), with a narrower credible interval than fit1 
+reflecting improved model efficiency from the random slope structure. The 95% credible 
+interval did not include zero, again providing strong evidence of a meaningful 
+difference between antibiotics at the population level.
+
+```{Fit 2 Priors}
+priors2 <- c(
+  prior(normal(5.6, 0.8), class = Intercept),
+  prior(normal(1.5, 0.5), class = b, coef = antibioticETP),
+  prior(exponential(1), class = sd, group = strain),
+  prior(exponential(1), class = sd, group = run_id),
+  prior(exponential(1), class = sd, group = operator),
+  prior(exponential(1), class = sigma),
+  prior(lkj(2), class = cor, group = strain)
+)
+```
+
+```{Fit 2}
+fit2 <- brm(
+  log2mic | cens(censored) ~ antibiotic + (antibiotic | strain) + (1 | run_id) + (1 | operator),
+  data = mic,
+  family = gaussian(),
+  prior = priors2,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 42,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.95)
+)
+```
+
+```{Fit 2 Summary}
+summary(fit2)
+```
+
+```{Fit 2 Diagnostic Plot}
+plot(fit2)
+```
+
+```{Fit 2 Posterior Median SD}
+fit2 %>%
+  spread_draws(r_strain[strain, term]) %>%
+  filter(term == "antibioticETP") %>%
+  group_by(strain) %>%
+  median_qi(r_strain, .width = 0.95) %>%
+  arrange(desc(r_strain)) %>%
+  ggplot(aes(y = reorder(strain, r_strain), x = r_strain, xmin = .lower, xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Strain-specific ETP vs CAZ difference (log2 scale)",
+       y = "Strain",
+       title = "How much higher is ETP MIC vs CAZ MIC per strain?") +
+  theme_bw()
+```
+
+### Model 3 (fit3) — Antibiotic-Specific Residual Variance
+
+fit3 extended fit2 by allowing the residual standard deviation (sigma) to vary by 
+antibiotic, addressing the bimodal distribution observed in posterior predictive checks 
+of fit1 and fit2. This was implemented using a sigma submodel — `sigma ~ antibiotic` 
+— via the `bf()` brmsformula wrapper. All parameters achieved $\hat{R}$ = 1.00 with 
+bulk ESS values well above 1000, indicating good convergence.
+
+#### Variance Components
+
+Strain intercept variation remained the dominant source of variability and was 
+consistent across all three models (SD = 2.90, 95% CrI: 2.08–4.02). Strain-to-strain 
+variation in the ETP vs CAZ difference was similarly stable relative to fit2 
+(SD = 1.85, 95% CrI: 1.16–2.77), confirming that strain-specific antibiotic 
+resistance patterns are a genuine feature of the data rather than a modeling artifact.
+
+The negative correlation between strain intercepts and ETP slopes strengthened 
+slightly in fit3 (cor = -0.50, 95% CrI: -0.83–0.04), with the credible interval now 
+nearly excluding zero. This provides stronger — though still cautious — evidence that 
+strains with higher baseline CAZ resistance tend to show a smaller strain-specific ETP 
+effect.
+
+Run variation remained small and consistent with fit2 (SD = 0.33, 95% CrI: 
+0.03–1.05). Operator variation was similarly small (SD = 0.68, 95% CrI: 0.31–1.52), 
+continuing to suggest good reproducibility across technicians.
+
+#### Fixed Effects
+
+The grand mean CAZ intercept remained stable across all three models (5.29 log2 
+µg/mL, 95% CrI: 4.12–6.40, ≈ 39 µg/mL). The average ETP fixed effect was consistent 
+with fit1 and fit2 (2.11 log2 dilutions, 95% CrI: 1.26–2.90), again with the 95% 
+credible interval excluding zero.
+
+#### Sigma Submodel
+
+The sigma submodel revealed meaningful differences in residual spread between the two 
+antibiotics. The baseline sigma intercept on the log scale was 0.39 (95% CrI: 
+0.28–0.51), corresponding to a CAZ residual SD of e^0.39 ≈ 1.48 log2 dilutions. The 
+ETP sigma coefficient was -0.82 (95% CrI: -0.96 to -0.68), indicating that residual 
+variation was substantially lower for ETP than CAZ — e^(0.39 - 0.82) ≈ 0.65 log2 
+dilutions. This is consistent with the observation that ETP MICs were more 
+concentrated at the upper end of the dilution range, particularly due to the high 
+proportion of right-censored observations, while CAZ MICs were more spread across the 
+full dilution range. The credible intervals for both sigma parameters excluded zero, 
+providing strong evidence that residual variance differs meaningfully between 
+antibiotics.
+
+```{Fit 3 Priors}
+priors3 <- c(
+  prior(normal(5.6, 0.8), class = Intercept),
+  prior(normal(1.5, 0.5), class = b, coef = antibioticETP),
+  prior(exponential(1), class = sd, group = strain),
+  prior(exponential(1), class = sd, group = run_id),
+  prior(exponential(1), class = sd, group = operator),
+  #prior(exponential(1), class = sigma),
+  prior(lkj(2), class = cor, group = strain),
+  prior(normal(0, 1), class = b, dpar = "sigma")
+)
+```
+
+```{Fit 3}
+fit3 <- brm(
+  bf(log2mic | cens(censored) ~ antibiotic + (antibiotic | strain) + (1 | run_id) + (1 | operator),
+     sigma ~ antibiotic),
+  data = mic,
+  family = gaussian(),
+  prior = priors3,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 42,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.95)
+)
+```
+
+```{Fit 3 summary}
+summary(fit3)
+```
+
+```{Fit 3 Diagnostic Plot}
+plot(fit3)
+```
+
+```{Fit 3 Posterior Median SD}
+fit3 %>%
+  spread_draws(r_strain[strain, term]) %>%
+  filter(term == "Intercept") %>%
+  median_qi(r_strain, .width = 0.95) %>%
+  ggplot(aes(y = reorder(strain, r_strain), x = r_strain, xmin = .lower, xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Strain-level deviation from grand mean (log2 scale)",
+       y = "Strain",
+       title = "Strain random effects - fit3") +
+  theme_bw()
+```
+
+```{Fit 3 Posterior Medians for 29 strains}
+fit3 %>%
+  spread_draws(r_strain[strain, term], b_Intercept, b_antibioticETP) %>%
+  pivot_wider(names_from = term, values_from = r_strain) %>%
+  mutate(
+    caz_log2 = b_Intercept + Intercept,
+    etp_log2 = b_Intercept + b_antibioticETP + Intercept + antibioticETP,
+    caz_mic = 2^caz_log2,
+    etp_mic = 2^etp_log2
+  ) %>%
+  group_by(strain) %>%
+  median_qi(caz_mic, etp_mic, .width = 0.95) %>%
+  arrange(desc(caz_mic)) %>%
+  print(n = 29)
+```
+
+```{Fit 3 Posterior Observed vs Simulated Plot}
+pp_check(fit3, ndraws = 100)
+```
+
+```{Linearity Check}
+res <- residuals(fit3)
+res_df <- as.data.frame(res)
+
+ggplot(res_df, aes(x = Estimate)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(x = "Residuals", title = "Residual distribution - fit3") +
+  theme_bw()
+```
+
+## Conclusions
+
+Standard approaches to summarizing MIC data are inadequate for datasets of this 
+complexity. Treating censored observations as exact values of 256 µg/mL or discarding 
+them entirely introduces bias by attenuating resistance estimates — understating how 
+resistant the most resistant strains truly are. Simple summary statistics such as the 
+raw median MIC ignore the multiple sources of variation present in the data, including 
+day-to-day batch effects and operator-to-operator differences that, if unaccounted for, 
+inflate apparent strain-level variability.
+
+The Bayesian hierarchical framework developed here addresses each of these limitations 
+simultaneously. Right-censored observations are handled naturally by evaluating the 
+likelihood as P(MIC > 256) rather than treating the ceiling value as an exact 
+measurement, propagating uncertainty from censored strains honestly through to the 
+final posterior estimates. Operator and run variation are explicitly partitioned from 
+true strain-level differences, yielding cleaner estimates of each strain's underlying 
+resistance. The random slope structure of fit2 and fit3 revealed that the ETP vs CAZ 
+difference is not uniform across strains — a finding that a fixed effects model would 
+have missed entirely — with strains such as Pa_29605 and Pa_6214 showing dramatically 
+higher ETP resistance relative to CAZ despite moderate CAZ MICs.
+
+Across all three models the fixed and random effect estimates were stable, providing 
+confidence that the results are robust to modeling choices. The progressive model 
+building approach — from random intercepts only (fit1) to strain-specific antibiotic 
+effects (fit2) to antibiotic-specific residual variance (fit3) — demonstrated 
+meaningful improvements at each step while maintaining interpretability.
+
+---
+
+## Future Directions
+
+Posterior median MIC estimates from fit3 will be prospectively validated for select 
+strains by performing fresh Broth Microdilution assays from frozen stocks. Strains 
+Pa_122268 and PAO1::lux have been streaked onto LB agar plates and will be retested 
+to determine whether their observed MICs fall within the 95% credible intervals 
+estimated by the model. This validation step will provide a direct empirical test of 
+the model's predictive accuracy and will be incorporated into this document upon 
+completion.
+
+Additional future directions include fitting an ordinal model that treats MIC values 
+as truly ordered categorical rather than continuous — arguably the most scientifically 
+precise representation of dilution series data — and expanding the strain collection 
+to include a broader range of resistance phenotypes and genotypes.
+
