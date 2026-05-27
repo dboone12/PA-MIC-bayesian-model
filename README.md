@@ -1,2 +1,4 @@
 # PA-MIC-bayesian-model
 Bayesian hierarchical mixed effects modeling of antimicrobial MIC data with censoring in R
+The Minimum Inhibitory Concentration (MIC) assay is perhaps the most ubiquitous assay in microbiology research. Its goal is to identify the lowest concentration of a compound that inhibits pathogen growth. Traditionally, the assay is performed on a base-2 dilution scale — each tested concentration is half the previous one. This creates a fundamental limitation: because the true MIC falls somewhere between two tested concentrations, it is interval censored rather than directly observed. Reporting a single doubling-dilution value discards this uncertainty entirely.
+This project applies a Bayesian mixed-effects model that accounts for common sources of variation in MIC assays to generate continuous posterior median estimates for 29 isolates of Pseudomonas aeruginosa tested against Ceftazidime, a standard-of-care antibiotic. 
